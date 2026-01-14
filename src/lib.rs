@@ -8,6 +8,7 @@ mod owned;
 mod stack;
 
 use git2::DiffStats;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -47,7 +48,31 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
             // "." will still refer to the root workdir.
             let pathspec = ["."];
             let mut index = repo.index()?;
+            
+            // Save extended flags (especially skip-worktree) before add_all
+            // to preserve them after the index is rebuilt
+            let mut saved_flags: HashMap<Vec<u8>, u16> = HashMap::new();
+            for i in 0..index.len() {
+                if let Some(entry) = index.get(i) {
+                    // Save flags_extended for entries that have them set
+                    if entry.flags_extended != 0 {
+                        saved_flags.insert(entry.path.clone(), entry.flags_extended);
+                    }
+                }
+            }
+            
             index.add_all(pathspec.iter(), git2::IndexAddOption::DEFAULT, None)?;
+            
+            // Restore extended flags for entries that had them
+            for i in 0..index.len() {
+                if let Some(mut entry) = index.get(i) {
+                    if let Some(&flags) = saved_flags.get(&entry.path) {
+                        entry.flags_extended = flags;
+                        index.add(&entry)?;
+                    }
+                }
+            }
+            
             index.write()?;
 
             if nothing_left_in_index(repo)? {
@@ -1959,6 +1984,66 @@ lines
                     "msg": "No changes staged, even after auto-staging. \
                            Try adding something to the index."})],
         );
+    }
+
+    #[test]
+    fn autostage_preserves_skip_worktree_flag() {
+        let (ctx, file_path) = repo_utils::prepare_repo();
+
+        // Set skip-worktree on the file
+        repo_utils::set_skip_worktree(&ctx, &file_path);
+        
+        // Verify skip-worktree is set
+        assert!(
+            repo_utils::is_skip_worktree(&ctx.repo, &file_path),
+            "skip-worktree should be set before test"
+        );
+
+        // Enable auto-staging
+        ctx.repo
+            .config()
+            .unwrap()
+            .set_bool(config::AUTO_STAGE_IF_NOTHING_STAGED_CONFIG_NAME, true)
+            .unwrap();
+
+        // Modify the file in working tree (even though it has skip-worktree)
+        let path = ctx.join(&file_path);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let modifications = format!("{contents}\nnew_line");
+        std::fs::write(&path, &modifications).unwrap();
+
+        // Ensure no staged changes (index matches HEAD) to trigger auto-staging
+        // The index should still have entries, just no staged changes
+        assert!(
+            nothing_left_in_index(&ctx.repo).unwrap(),
+            "Index should have no staged changes to trigger auto-staging"
+        );
+
+        // Run git-absorb (should trigger auto-stage)
+        let capturing_logger = log_utils::CapturingLogger::new();
+        run_with_repo(&capturing_logger.logger, &DEFAULT_CONFIG, &ctx.repo).unwrap();
+
+        // Verify skip-worktree flag is still set after auto-staging
+        assert!(
+            repo_utils::is_skip_worktree(&ctx.repo, &file_path),
+            "skip-worktree should be preserved after auto-staging"
+        );
+
+        // Verify the file doesn't show up in git status
+        // (skip-worktree files shouldn't be reported as modified)
+        let statuses = ctx.repo.statuses(None).unwrap();
+        let file_status = statuses
+            .iter()
+            .find(|s| s.path() == Some(file_path.to_str().unwrap()));
+        
+        // The file should either not be in status, or if it is, it should only show as
+        // index-modified (not worktree-modified) because skip-worktree hides worktree changes
+        if let Some(status) = file_status {
+            assert!(
+                !status.status().is_wt_modified(),
+                "skip-worktree file should not show worktree modifications in status"
+            );
+        }
     }
 
     #[test]
