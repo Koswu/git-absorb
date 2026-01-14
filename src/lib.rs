@@ -64,11 +64,14 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
             index.add_all(pathspec.iter(), git2::IndexAddOption::DEFAULT, None)?;
             
             // Restore extended flags for entries that had them
-            for i in 0..index.len() {
-                if let Some(mut entry) = index.get(i) {
-                    if let Some(&flags) = saved_flags.get(&entry.path) {
-                        entry.flags_extended = flags;
-                        index.add(&entry)?;
+            // Only iterate if we have flags to restore
+            if !saved_flags.is_empty() {
+                for i in 0..index.len() {
+                    if let Some(mut entry) = index.get(i) {
+                        if let Some(&flags) = saved_flags.get(&entry.path) {
+                            entry.flags_extended = flags;
+                            index.add(&entry)?;
+                        }
                     }
                 }
             }
