@@ -8,6 +8,7 @@ mod owned;
 mod stack;
 
 use git2::DiffStats;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -31,6 +32,53 @@ pub fn run(logger: &slog::Logger, config: &Config) -> Result<()> {
     run_with_repo(logger, config, &repo)
 }
 
+/// Save extended flags from index entries that have them set.
+/// Returns a HashMap mapping paths to their extended flags.
+fn save_index_extended_flags(
+    index: &git2::Index,
+    logger: &slog::Logger,
+) -> HashMap<Vec<u8>, u16> {
+    let mut saved_flags = HashMap::new();
+    for i in 0..index.len() {
+        if let Some(entry) = index.get(i) {
+            if entry.flags_extended != 0 {
+                saved_flags.insert(entry.path.clone(), entry.flags_extended);
+                debug!(logger, "Saving extended flags for entry";
+                       "path" => String::from_utf8_lossy(&entry.path).to_string(),
+                       "flags_extended" => format!("{:#x}", entry.flags_extended));
+            }
+        }
+    }
+    debug!(logger, "Saved extended flags for {} entries", saved_flags.len());
+    saved_flags
+}
+
+/// Restore extended flags to index entries from a saved HashMap.
+/// Only modifies entries whose paths are found in the saved_flags map.
+fn restore_index_extended_flags(
+    index: &mut git2::Index,
+    saved_flags: &HashMap<Vec<u8>, u16>,
+    logger: &slog::Logger,
+) -> Result<()> {
+    if saved_flags.is_empty() {
+        return Ok(());
+    }
+    
+    // Iterate over index entries and restore flags for those in saved_flags
+    for i in 0..index.len() {
+        if let Some(mut entry) = index.get(i) {
+            if let Some(&flags) = saved_flags.get(&entry.path) {
+                debug!(logger, "Restoring extended flags for entry";
+                       "path" => String::from_utf8_lossy(&entry.path).to_string(),
+                       "flags_extended" => format!("{:#x}", flags));
+                entry.flags_extended = flags;
+                index.add(&entry)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository) -> Result<()> {
     let config = config::unify(config, repo);
 
@@ -47,7 +95,16 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
             // "." will still refer to the root workdir.
             let pathspec = ["."];
             let mut index = repo.index()?;
+            
+            // Save extended flags (especially skip-worktree) before add_all
+            // to preserve them after the index is rebuilt
+            let saved_flags = save_index_extended_flags(&index, logger);
+            
             index.add_all(pathspec.iter(), git2::IndexAddOption::DEFAULT, None)?;
+            
+            // Restore extended flags for entries that had them
+            restore_index_extended_flags(&mut index, &saved_flags, logger)?;
+            
             index.write()?;
 
             if nothing_left_in_index(repo)? {
@@ -357,9 +414,17 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
     if we_added_everything_to_index {
         // now that the fixup commits have been created,
         // we should unstage the remaining changes from the index.
-
+        
         let mut index = repo.index()?;
+        
+        // Save extended flags before read_tree (similar to auto-staging)
+        let saved_flags = save_index_extended_flags(&index, logger);
+        
         index.read_tree(&head_tree)?;
+        
+        // Restore extended flags after read_tree
+        restore_index_extended_flags(&mut index, &saved_flags, logger)?;
+        
         index.write()?;
     }
 
@@ -1959,6 +2024,103 @@ lines
                     "msg": "No changes staged, even after auto-staging. \
                            Try adding something to the index."})],
         );
+    }
+
+    #[test]
+    fn autostage_preserves_skip_worktree_flag() {
+        let (ctx, file_path) = repo_utils::prepare_repo();
+
+        // Set skip-worktree on the file
+        repo_utils::set_skip_worktree(&ctx, &file_path);
+        
+        // Verify skip-worktree is set
+        assert!(
+            repo_utils::is_skip_worktree(&ctx.repo, &file_path),
+            "skip-worktree should be set before test"
+        );
+
+        // Enable auto-staging
+        ctx.repo
+            .config()
+            .unwrap()
+            .set_bool(config::AUTO_STAGE_IF_NOTHING_STAGED_CONFIG_NAME, true)
+            .unwrap();
+
+        // Modify the file in working tree (even though it has skip-worktree)
+        let path = ctx.join(&file_path);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let modifications = format!("{contents}\nnew_line");
+        std::fs::write(&path, &modifications).unwrap();
+
+        // Ensure no staged changes (index matches HEAD) to trigger auto-staging
+        // The index should still have entries, just no staged changes
+        assert!(
+            nothing_left_in_index(&ctx.repo).unwrap(),
+            "Index should have no staged changes to trigger auto-staging"
+        );
+
+        // Run git-absorb (should trigger auto-stage)
+        let capturing_logger = log_utils::CapturingLogger::new();
+        run_with_repo(&capturing_logger.logger, &DEFAULT_CONFIG, &ctx.repo).unwrap();
+
+        // Verify skip-worktree flag is still set after auto-staging
+        assert!(
+            repo_utils::is_skip_worktree(&ctx.repo, &file_path),
+            "skip-worktree should be preserved after auto-staging"
+        );
+
+        // Verify the file doesn't show up in git status
+        // (skip-worktree files shouldn't be reported as modified)
+        let statuses = ctx.repo.statuses(None).unwrap();
+        let file_status = statuses
+            .iter()
+            .find(|s| s.path() == Some(file_path.to_str().unwrap()));
+        
+        // The file should either not be in status, or if it is, it should only show as
+        // index-modified (not worktree-modified) because skip-worktree hides worktree changes
+        if let Some(status) = file_status {
+            assert!(
+                !status.status().is_wt_modified(),
+                "skip-worktree file should not show worktree modifications in status"
+            );
+        }
+    }
+
+    #[test]
+    fn autostage_preserves_skip_worktree_with_other_files() {
+        let (ctx, file_path) = repo_utils::prepare_repo();
+        
+        // Create a second file
+        let file2_path = PathBuf::from("file2.txt");
+        std::fs::write(ctx.join(&file2_path), "content2").unwrap();
+        {
+            let tree = repo_utils::add(&ctx.repo, &file2_path);
+            let head_commit = ctx.repo.head().unwrap().peel_to_commit().unwrap();
+            repo_utils::commit(&ctx.repo, "HEAD", "Add file2", &tree, &[&head_commit]);
+        }
+        
+        // Set skip-worktree on file1
+        repo_utils::set_skip_worktree(&ctx, &file_path);
+        
+        // Verify skip-worktree is set
+        assert!(repo_utils::is_skip_worktree(&ctx.repo, &file_path));
+        assert!(!repo_utils::is_skip_worktree(&ctx.repo, &file2_path));
+        
+        // Enable auto-staging
+        ctx.repo.config().unwrap().set_bool(config::AUTO_STAGE_IF_NOTHING_STAGED_CONFIG_NAME, true).unwrap();
+        
+        // Modify both files
+        std::fs::write(ctx.join(&file_path), "modified1").unwrap();
+        std::fs::write(ctx.join(&file2_path), "modified2").unwrap();
+        
+        // Run git-absorb (should trigger auto-stage)
+        let capturing_logger = log_utils::CapturingLogger::new();
+        run_with_repo(&capturing_logger.logger, &DEFAULT_CONFIG, &ctx.repo).unwrap();
+        
+        // Verify skip-worktree flag is still set on file1
+        assert!(repo_utils::is_skip_worktree(&ctx.repo, &file_path), "skip-worktree should be preserved on file1");
+        // Verify file2 doesn't have skip-worktree
+        assert!(!repo_utils::is_skip_worktree(&ctx.repo, &file2_path), "file2 should not have skip-worktree");
     }
 
     #[test]

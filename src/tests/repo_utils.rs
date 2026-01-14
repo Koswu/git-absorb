@@ -182,3 +182,45 @@ pub fn commit<'repo>(
     )
     .unwrap()
 }
+
+/// Set the skip-worktree flag on a file in the index.
+/// Uses `git update-index --skip-worktree` command since libgit2 doesn't expose
+/// a direct API to set index entry flags after the entry is created.
+pub fn set_skip_worktree(ctx: &Context, path: &Path) {
+    // First ensure the index is written to disk
+    let mut index = ctx.repo.index().unwrap();
+    index.write().unwrap();
+    drop(index); // Release the lock on the index
+    
+    let output = std::process::Command::new("git")
+        .arg("update-index")
+        .arg("--skip-worktree")
+        .arg(path)
+        .current_dir(ctx.dir.path())
+        .output()
+        .unwrap();
+    
+    assert!(
+        output.status.success(),
+        "Failed to set skip-worktree on {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    
+    // Reload the index to pick up the changes
+    let mut index = ctx.repo.index().unwrap();
+    index.read(true).unwrap();
+}
+
+/// Check if a file has the skip-worktree flag set in the index.
+pub fn is_skip_worktree(repo: &git2::Repository, path: &Path) -> bool {
+    // Reload index to ensure we have the latest state
+    let mut index = repo.index().unwrap();
+    index.read(true).unwrap();
+    
+    if let Some(entry) = index.get_path(path, 0) {
+        (entry.flags_extended & git2::IndexEntryExtendedFlag::SKIP_WORKTREE.bits()) != 0
+    } else {
+        false
+    }
+}
