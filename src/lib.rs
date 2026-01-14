@@ -32,6 +32,53 @@ pub fn run(logger: &slog::Logger, config: &Config) -> Result<()> {
     run_with_repo(logger, config, &repo)
 }
 
+/// Save extended flags from index entries that have them set.
+/// Returns a HashMap mapping paths to their extended flags.
+fn save_index_extended_flags(
+    index: &git2::Index,
+    logger: &slog::Logger,
+) -> HashMap<Vec<u8>, u16> {
+    let mut saved_flags = HashMap::new();
+    for i in 0..index.len() {
+        if let Some(entry) = index.get(i) {
+            if entry.flags_extended != 0 {
+                saved_flags.insert(entry.path.clone(), entry.flags_extended);
+                debug!(logger, "Saving extended flags for entry";
+                       "path" => String::from_utf8_lossy(&entry.path).to_string(),
+                       "flags_extended" => format!("{:#x}", entry.flags_extended));
+            }
+        }
+    }
+    debug!(logger, "Saved extended flags for {} entries", saved_flags.len());
+    saved_flags
+}
+
+/// Restore extended flags to index entries from a saved HashMap.
+/// Only modifies entries whose paths are found in the saved_flags map.
+fn restore_index_extended_flags(
+    index: &mut git2::Index,
+    saved_flags: &HashMap<Vec<u8>, u16>,
+    logger: &slog::Logger,
+) -> Result<()> {
+    if saved_flags.is_empty() {
+        return Ok(());
+    }
+    
+    // Iterate over index entries and restore flags for those in saved_flags
+    for i in 0..index.len() {
+        if let Some(mut entry) = index.get(i) {
+            if let Some(&flags) = saved_flags.get(&entry.path) {
+                debug!(logger, "Restoring extended flags for entry";
+                       "path" => String::from_utf8_lossy(&entry.path).to_string(),
+                       "flags_extended" => format!("{:#x}", flags));
+                entry.flags_extended = flags;
+                index.add(&entry)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository) -> Result<()> {
     let config = config::unify(config, repo);
 
@@ -51,38 +98,12 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
             
             // Save extended flags (especially skip-worktree) before add_all
             // to preserve them after the index is rebuilt
-            let mut saved_flags: HashMap<Vec<u8>, u16> = HashMap::new();
-            for i in 0..index.len() {
-                if let Some(entry) = index.get(i) {
-                    // Save flags_extended for entries that have them set
-                    if entry.flags_extended != 0 {
-                        saved_flags.insert(entry.path.clone(), entry.flags_extended);
-                        debug!(logger, "Saving extended flags for entry";
-                               "path" => String::from_utf8_lossy(&entry.path).to_string(),
-                               "flags_extended" => format!("{:#x}", entry.flags_extended));
-                    }
-                }
-            }
-            
-            debug!(logger, "Saved extended flags for {} entries", saved_flags.len());
+            let saved_flags = save_index_extended_flags(&index, logger);
             
             index.add_all(pathspec.iter(), git2::IndexAddOption::DEFAULT, None)?;
             
             // Restore extended flags for entries that had them
-            // Only iterate if we have flags to restore
-            if !saved_flags.is_empty() {
-                for i in 0..index.len() {
-                    if let Some(mut entry) = index.get(i) {
-                        if let Some(&flags) = saved_flags.get(&entry.path) {
-                            debug!(logger, "Restoring extended flags for entry";
-                                   "path" => String::from_utf8_lossy(&entry.path).to_string(),
-                                   "flags_extended" => format!("{:#x}", flags));
-                            entry.flags_extended = flags;
-                            index.add(&entry)?;
-                        }
-                    }
-                }
-            }
+            restore_index_extended_flags(&mut index, &saved_flags, logger)?;
             
             index.write()?;
 
@@ -397,28 +418,12 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
         let mut index = repo.index()?;
         
         // Save extended flags before read_tree (similar to auto-staging)
-        let mut saved_flags: HashMap<Vec<u8>, u16> = HashMap::new();
-        for i in 0..index.len() {
-            if let Some(entry) = index.get(i) {
-                if entry.flags_extended != 0 {
-                    saved_flags.insert(entry.path.clone(), entry.flags_extended);
-                }
-            }
-        }
+        let saved_flags = save_index_extended_flags(&index, logger);
         
         index.read_tree(&head_tree)?;
         
         // Restore extended flags after read_tree
-        if !saved_flags.is_empty() {
-            for i in 0..index.len() {
-                if let Some(mut entry) = index.get(i) {
-                    if let Some(&flags) = saved_flags.get(&entry.path) {
-                        entry.flags_extended = flags;
-                        index.add(&entry)?;
-                    }
-                }
-            }
-        }
+        restore_index_extended_flags(&mut index, &saved_flags, logger)?;
         
         index.write()?;
     }
